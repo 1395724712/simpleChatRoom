@@ -157,3 +157,94 @@ int setupTCPServerSocket(char* port){
     freeaddrinfo(res);
     return sockfd;
 }
+
+void setNonBlock(int sockfd){
+    //设置套接字sockfd为非阻塞的，以便用于ET模式
+    int oldOpt = fcntl(sockfd,F_GETFL);
+    int newOpt = oldOpt|O_NONBLOCK;
+    int rtnVal = fcntl(sockfd,F_SETFL,newOpt);
+    if(rtnVal==-1)
+        cout<<"setNonBlock非阻塞设置出错："<<strerror(errno)<<endl;
+}
+
+void addfd(int epfd,int sockfd,bool enableET){
+    //将sockfd加入到epfd指向的事件表中
+    //创建事件
+    struct epoll_event *event = new struct epoll_event;
+    event->data->fd = sockfd;
+    if(enableET)
+        event->events = EPOLLIN|EPOLLET;
+    else
+        event->events = EPOLLIN;
+    //添加事件
+    int rtnVal = epoll_ctl(epfd,EPOLL_CTL_ADD,sockfd,event);
+    if(rtnVal<0)
+        cout<<"addfd failed\t"<<strerror(errno)<<endl;
+    //释放指针
+    free(event);
+}
+
+void dealET(struct epoll_event* events,int num,int listenfd,vector<int> clntfd){
+    /*
+    * Author:wh
+    * Description:以ET模式处理EPOLLIN事件
+    * Resolution: 1 如果是链接到达事件：accept创建新套接字newfd，newfd要addfd加入事件表和clnfd中，并转为非阻塞，
+    * 2 如果是数据到达事件，反复读取，直到rtnVal = 0(链接关闭),errno = EAGAIN or EWOULDBLOCK 将收到的数据发送给其余的clntfd
+    */
+
+    for(int i=0;i<num;i++){
+        //遍历每个就绪事件
+        if(events[i].data.fd == listenfd){
+            //是链接就绪事件
+            //创建新套接字
+            int newfd = accept(listenfd,nullptr,nullptr);
+            if(newfd<0)
+                cout<<"accept in dealET failed\t"<< strerror(errno)<<endl;
+            //新套接字加入clntfd中
+            clntfd.push_back(newfd);
+            //新套接字转为非阻塞
+            setNonBlock(newfd);
+            //新套接字加入事件表中
+            addfd(newfd);
+        }
+        else if(events[i].events|EPOLLIN){
+            //如果是数据到达事件
+            //以ET方式处理
+            //将数据发送到其他客户
+            char buf[MAX_BUF_SIZE];
+            int recvNum = recv(events[i].data.fd,buf,MAX_BUF_SIZE-1,0);
+            while(recvNum>0){
+                //将数据发送给其他客户
+                for(auto fd:clntfd)
+                    if(fd!=events[i].data.fd&&fd!=-1)
+                        send(fd,buf,recvNum,0);
+                memset(buf,'\0',MAX_BUF_SIZE);
+                recvNum = recv(events[i].data.fd,buf,MAX_BUF_SIZE-1,0);
+            }
+            if(recvNum<=0){
+
+                if(errno==EAGAIN||errno==EWOULDBLOCK){
+                    //如果是数据读完
+                    //就继续执行下一个套接字
+                    continue;
+                }
+
+                //出错或者链接关闭，删除当前套接字
+                //删除事件表中相关项
+                epoll_ctl(epfd,EPOLL_CTL_DEL,events[i].data.fd);
+                //关闭套接字
+                close(events[i].data.fd);
+                //删除clntfd中相关项
+                for(int j=0;j<clntfd;j++){
+                    if(clntfd[j]==events[i].data.fd){
+                        clntfd[j] = -1;
+                        break;
+                    }
+                }
+            }
+        }
+        else{
+            cout<<"Something happned"<<endl;
+        }
+    }
+}
